@@ -5,6 +5,7 @@ from io import BytesIO
 
 from PIL import Image
 from google import genai
+from google.genai import errors as genai_errors
 
 # ========== 1. 這裡直接寫死你的 API Key ==========
 # 到 Google AI Studio 產生一組 GEMINI_API_KEY，整串貼上來
@@ -165,22 +166,31 @@ def build_image_prompt(row, bullets, full_desc: str) -> str:
 
 def generate_edited_image(prompt: str, base_image: Image.Image, out_path: Path) -> bool:
     """
-    用「文字 + 原始商品圖」呼叫 Gemini 做圖像編輯，
-    回傳是否成功產出圖片。
+    用「文字 + 原始商品圖」呼叫 Gemini 做圖像編輯。
+    如果遇到 ServerError 或其他錯誤，回傳 False，不讓整支程式中止。
     """
-    # 根據官方文件：contents=[prompt, image] 就是 text+image-to-image
-    response = client.models.generate_content(
-        model=IMAGE_MODEL,
-        contents=[prompt, base_image],
-    )
+    try:
+        response = client.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=[prompt, base_image],
+        )
+    except genai_errors.ServerError as e:
+        # 這就是你剛剛遇到的 500 INTERNAL 這類
+        print(f"⚠️ 產圖時發生 ServerError：{e}")
+        return False
+    except Exception as e:
+        # 其他任何異常也當作這張圖失敗
+        print(f"⚠️ 產圖時發生未知錯誤：{e}")
+        return False
 
+    # 正常拿到 response，從 parts 抓圖
     for part in response.parts:
-        # 有可能有文字、有可能是圖片，我們只存圖片那個
         if part.inline_data is not None:
             img = part.as_image()
             img.save(out_path)
             return True
 
+    print("⚠️ 回應裡沒有圖片資料（可能是被安全審查擋掉或模型只回文字）")
     return False
 
 
@@ -190,11 +200,13 @@ def main():
     print(f"讀取 Excel：{EXCEL_PATH}")
     df = pd.read_excel(EXCEL_PATH)
 
+    skipped_records = []  # ⭐ 新增：用來記錄失敗／被跳過的商品
+
     for idx, row in df.iterrows():
         # 1) 先從 Excel 拿原本的 SKU
         raw_sku = row.get(COL_SKU) or row.get("商品ID")
 
-        # 2) 如果是空白 / NaN，就用列編號自動帶一個編號（這裡用 4 碼補零）
+        # 2) 如果是空白 / NaN，就用列編號自動帶一個編號（4 碼補零）
         if pd.isna(raw_sku) or str(raw_sku).strip() == "":
             sku = f"{idx + 1:04d}"   # 第 0 列 -> "0001", 第 1 列 -> "0002"...
         else:
@@ -202,11 +214,19 @@ def main():
 
         url = str(row.get(COL_IMG_URL) or row.get("圖片網址") or "").strip()
         desc = str(row.get(COL_DESC) or row.get("敘述") or "").strip()
+        name = str(row.get(COL_NAME) or "").strip()
 
         print(f"\n=== 處理第 {idx} 列（SKU={sku}） ===")
 
+        # 如果沒圖片 URL，也算一種「跳過」，順便記錄起來
         if not url:
             print("⚠️ 這列沒有圖片 URL，跳過")
+            skipped_records.append({
+                "SKU": sku,
+                "商品名稱": name,
+                "商品敘述": desc,
+                "商品圖URL": url,
+            })
             continue
 
         # 1) 下載原始商品圖
@@ -216,13 +236,21 @@ def main():
             print("✅ 圖片下載成功")
         except Exception as e:
             print(f"⚠️ 下載圖片失敗：{e}")
+            # 下載失敗也記錄起來
+            skipped_records.append({
+                "SKU": sku,
+                "商品名稱": name,
+                "商品敘述": desc,
+                "商品圖URL": url,
+            })
             continue
 
-        # 2) 用 Gemini 抽賣點
+        # 2) 用 Gemini 抽賣點（給圖片模型當參考）
         bullets = extract_key_points(desc)
         print("主圖賣點（AI 抽出）：", bullets)
 
-        # 3) 組 prompt（包含：不要改商品本體）
+        # 3) 組 prompt（讓 Banana Pro 自己生標題／副標／賣點）
+        #    如果你有做截斷，可以在這裡用 desc[:800] 之類
         prompt = build_image_prompt(row, bullets, desc)
 
         # 4) 丟給 Gemini 做圖像編輯
@@ -232,9 +260,28 @@ def main():
         if ok:
             print(f"🎨 已輸出主圖：{out_file}")
         else:
-            print("⚠️ 沒有從回應中拿到圖片（可能是安全審查或其他錯誤）")
+            print("⚠️ 產圖失敗，此商品將列入跳過清單")
+            skipped_records.append({
+                "SKU": sku,
+                "商品名稱": name,
+                "商品敘述": desc,
+                "商品圖URL": url,
+            })
+            # 不 raise，直接處理下一列
+            continue
+
+    # 迴圈跑完後，把所有跳過的商品輸出成一個 Excel
+    if skipped_records:
+        skipped_df = pd.DataFrame(
+            skipped_records,
+            columns=["SKU", "商品名稱", "商品敘述", "商品圖URL"]
+        )
+        skipped_path = "skipped_products.xlsx"
+        skipped_df.to_excel(skipped_path, index=False)
+        print(f"\n⚠️ 共 {len(skipped_records)} 筆商品產圖失敗或被跳過，已輸出：{skipped_path}")
+    else:
+        print("\n✅ 所有商品皆成功產圖，沒有跳過項目。")
 
 
 if __name__ == "__main__":
     main()
-
