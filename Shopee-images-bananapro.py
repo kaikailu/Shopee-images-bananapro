@@ -191,7 +191,15 @@ def main():
     df = pd.read_excel(EXCEL_PATH)
 
     for idx, row in df.iterrows():
-        sku = str(row.get(COL_SKU) or row.get("商品ID") or idx)
+        # 1) 先從 Excel 拿原本的 SKU
+        raw_sku = row.get(COL_SKU) or row.get("商品ID")
+
+        # 2) 如果是空白 / NaN，就用列編號自動帶一個編號（這裡用 4 碼補零）
+        if pd.isna(raw_sku) or str(raw_sku).strip() == "":
+            sku = f"{idx + 1:04d}"   # 第 0 列 -> "0001", 第 1 列 -> "0002"...
+        else:
+            sku = str(raw_sku).strip()
+
         url = str(row.get(COL_IMG_URL) or row.get("圖片網址") or "").strip()
         desc = str(row.get(COL_DESC) or row.get("敘述") or "").strip()
 
@@ -229,3 +237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
